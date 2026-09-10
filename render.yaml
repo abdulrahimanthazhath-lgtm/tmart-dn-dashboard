@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: tmart-dn-dashboard
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+    disk:
+      name: tmart-sessions
+      mountPath: /tmp/tmart_sessions
+      sizeGB: 1
+    healthCheckPath: /
