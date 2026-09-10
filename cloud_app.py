@@ -30,19 +30,19 @@ def get_sid():
         session["sid"] = str(uuid.uuid4())[:12]
     return session["sid"]
 
-def sdir():
-    d = os.path.join(SESSIONS_DIR, get_sid())
+def sdir(sid=None):
+    d = os.path.join(SESSIONS_DIR, sid or get_sid())
     os.makedirs(d, exist_ok=True)
     return d
 
-def sfile(name):   return os.path.join(sdir(), name)
-def outdir():
-    d = sfile("output")
+def sfile(name, sid=None):   return os.path.join(sdir(sid), name)
+def outdir(sid=None):
+    d = sfile("output", sid)
     os.makedirs(d, exist_ok=True)
     return d
-def excel_path():  return sfile("DN_DATA.xlsx")
-def template_path():
-    p = sfile("template.docx")
+def excel_path(sid=None):  return sfile("DN_DATA.xlsx", sid)
+def template_path(sid=None):
+    p = sfile("template.docx", sid)
     if os.path.exists(p): return p
     g = os.path.join(BASE_DIR, "DN_INVOICE _FORMAT.docx")
     return g if os.path.exists(g) else None
@@ -73,8 +73,8 @@ def pdf_name(row):
 
 # ── Excel reading ──────────────────────────────────────────────────────────────
 
-def read_excel():
-    ep = excel_path()
+def read_excel(sid=None):
+    ep = excel_path(sid)
     if not os.path.exists(ep):
         return {"error": "No Excel uploaded — click 📂 Upload Excel"}
     try:
@@ -182,13 +182,13 @@ def subprocess_run_safe(cmd, timeout=120):
 
 # ── Single PDF generation ──────────────────────────────────────────────────────
 
-def generate_one(row):
-    tmpl = template_path()
+def generate_one(row, sid=None):
+    tmpl = template_path(sid)
     if not tmpl:
         return {"pdf_name": pdf_name(row), "ok": False,
                 "error": "No template — upload DN_INVOICE _FORMAT.docx"}
     pn       = pdf_name(row)
-    od       = outdir()
+    od       = outdir(sid)
     out_pdf  = os.path.join(od, pn)
     temp_doc = os.path.join(od, pn.replace(".pdf", "_filled.docx"))
     try:
@@ -212,11 +212,10 @@ def _run_batch(sid, rows_list):
     status = _jobs[sid]
     for row in rows_list:
         if status.get("cancelled"): break
-        r = generate_one(row)
+        r = generate_one(row, sid=sid)   # pass sid — no Flask session in thread
         status["done"]   += 1
         status["results"].append(r)
         if not r["ok"]: status["errors"].append(r)
-        # write progress to file so any worker can read it
         _write_job(sid, status)
     status["running"] = False
     _write_job(sid, status)
@@ -308,7 +307,8 @@ def api_generate_status():
 def api_generate():
     body      = request.json or {}
     rows_list = [item["row"] for item in body.get("rows", [])]
-    results   = [generate_one(r) for r in rows_list]
+    sid = get_sid()
+    results   = [generate_one(r, sid=sid) for r in rows_list]
     return jsonify({"results": results})
 
 @app.route("/api/send-email", methods=["POST"])
