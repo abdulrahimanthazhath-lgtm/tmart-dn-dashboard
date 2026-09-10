@@ -342,14 +342,22 @@ def api_send_email():
 @app.route("/api/gmail-settings", methods=["POST"])
 def api_gmail_settings():
     body = request.json or {}
-    session["gmail_user"] = body.get("user", "").strip()
-    session["gmail_pass"] = body.get("password", "").strip()
-    return jsonify({"ok": True, "user": session["gmail_user"]})
+    mode = body.get("mode", "smtp")   # "smtp" or "browser"
+    session["gmail_mode"] = mode
+    if mode == "smtp":
+        session["gmail_user"] = body.get("user", "").strip()
+        session["gmail_pass"] = body.get("password", "").strip()
+    else:  # browser mode — no password stored
+        session["gmail_user"] = body.get("user", "").strip()
+        session["gmail_pass"] = ""
+    return jsonify({"ok": True, "user": session["gmail_user"], "mode": mode})
 
 @app.route("/api/gmail-status")
 def api_gmail_status():
-    return jsonify({"configured": bool(session.get("gmail_user")),
-                    "user": session.get("gmail_user", "")})
+    mode = session.get("gmail_mode", "smtp")
+    user = session.get("gmail_user", "")
+    configured = bool(user) if mode == "browser" else bool(user and session.get("gmail_pass"))
+    return jsonify({"configured": configured, "user": user, "mode": mode})
 
 @app.route("/api/upload-excel", methods=["POST"])
 def api_upload_excel():
@@ -421,21 +429,21 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>tMart – Rebate DN Dashboard</title>
 <style>
-:root{--or:#FF6A00;--dark:#1C1C2E;--card:#27273D;--bdr:#3A3A55;--grn:#22C55E;--red:#EF4444;--blu:#3B82F6;--pur:#8B5CF6;--tl:#14B8A6;}
+:root{--or:#E05500;--dark:#F0F2F5;--card:#FFFFFF;--bdr:#D8DBE8;--grn:#16A34A;--red:#DC2626;--blu:#2563EB;--pur:#7C3AED;--tl:#0D9488;}
 *{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:"Segoe UI",sans-serif;background:var(--dark);color:#E2E2F0;min-height:100vh;}
+body{font-family:"Segoe UI",sans-serif;background:var(--dark);color:#1A1A2E;min-height:100vh;}
 nav{background:var(--card);border-bottom:3px solid var(--or);padding:14px 28px;display:flex;align-items:center;gap:14px;flex-wrap:wrap;}
-.logo{font-size:22px;font-weight:800;color:var(--or);}.sub{font-size:13px;color:#9999CC;flex:1;}
+.logo{font-size:22px;font-weight:800;color:var(--or);}.sub{font-size:13px;color:#666;flex:1;}
 .cards{display:flex;gap:16px;padding:22px 28px 0;flex-wrap:wrap;}
 .card{flex:1;min-width:140px;background:var(--card);border:1px solid var(--bdr);border-radius:10px;padding:16px 20px;}
-.card .num{font-size:28px;font-weight:700;color:var(--or);}.card .lbl{font-size:11px;color:#9999CC;margin-top:2px;text-transform:uppercase;letter-spacing:.5px;}
+.card .num{font-size:28px;font-weight:700;color:var(--or);}.card .lbl{font-size:11px;color:#666;margin-top:2px;text-transform:uppercase;letter-spacing:.5px;}
 .toolbar{display:flex;gap:8px;padding:16px 28px;flex-wrap:wrap;align-items:center;}
 input[type=file]{display:none;}
 button,label.btn{cursor:pointer;border:none;border-radius:7px;padding:9px 16px;font-size:13px;font-weight:600;transition:opacity .15s;display:inline-flex;align-items:center;gap:5px;}
 button:hover,label.btn:hover{opacity:.85;}
 .or{background:var(--or);color:#fff;}.grn{background:var(--grn);color:#fff;}.blu{background:var(--blu);color:#fff;}
 .pur{background:var(--pur);color:#fff;}.red{background:var(--red);color:#fff;}.tl{background:var(--tl);color:#fff;}
-.out{background:transparent;border:1px solid var(--bdr);color:#CCC;}
+.out{background:transparent;border:1px solid var(--bdr);color:#555;}
 .sm{padding:4px 10px;font-size:12px;border-radius:5px;}.sep{flex:1;}
 .tbl-wrap{padding:0 28px 40px;overflow-x:auto;}
 table{width:100%;border-collapse:collapse;font-size:13px;}
@@ -448,7 +456,7 @@ td{padding:9px 12px;vertical-align:middle;}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin .6s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
 #toast-wrap{position:fixed;bottom:22px;right:22px;display:flex;flex-direction:column;gap:8px;z-index:999;}
-.toast{background:var(--card);border-left:4px solid var(--grn);padding:11px 16px;border-radius:7px;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.4);animation:fi .2s;min-width:260px;max-width:420px;word-break:break-word;}
+.toast{background:var(--card);border-left:4px solid var(--grn);padding:11px 16px;border-radius:7px;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.15);animation:fi .2s;min-width:260px;max-width:420px;word-break:break-word;color:#1A1A2E;}
 .toast.err{border-color:var(--red);}@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1}}
 #pw{display:none;min-width:220px;}.pbar{height:6px;background:var(--bdr);border-radius:3px;overflow:hidden;margin-top:6px;}
 .pbar .fill{height:100%;background:var(--or);transition:width .4s;}
@@ -464,8 +472,8 @@ td{padding:9px 12px;vertical-align:middle;}
 #gmodal-inner{background:var(--card);border-radius:14px;width:440px;padding:28px;box-shadow:0 8px 40px rgba(0,0,0,.5);}
 #gmodal h3{color:var(--or);margin-bottom:16px;font-size:17px;}
 .field{margin-bottom:14px;}
-.field label{display:block;font-size:12px;color:#9999CC;margin-bottom:5px;text-transform:uppercase;letter-spacing:.4px;}
-.field input{width:100%;background:#1a1a2e;border:1px solid var(--bdr);border-radius:7px;padding:9px 12px;color:#E2E2F0;font-size:14px;outline:none;}
+.field label{display:block;font-size:12px;color:#666;margin-bottom:5px;text-transform:uppercase;letter-spacing:.4px;}
+.field input{width:100%;background:#F7F8FA;border:1px solid var(--bdr);border-radius:7px;padding:9px 12px;color:#1A1A2E;font-size:14px;outline:none;}
 .field input:focus{border-color:var(--or);}
 .hint{font-size:11px;color:#666;margin-top:4px;line-height:1.5;}
 .hint a{color:var(--tl);}
@@ -475,7 +483,16 @@ td{padding:9px 12px;vertical-align:middle;}
 </head>
 <body>
 <nav>
-  <span class="logo">tMart</span>
+  <svg height="38" viewBox="0 0 190 38" xmlns="http://www.w3.org/2000/svg" style="flex-shrink:0;">
+    <!-- talabat orange block -->
+    <rect x="0" y="2" width="112" height="34" rx="5" fill="#FF6200"/>
+    <text x="56" y="25" font-family="'Segoe UI',Arial,sans-serif" font-size="18" font-weight="800"
+          fill="white" text-anchor="middle" letter-spacing="0.5">talabat</text>
+    <!-- mart border block -->
+    <rect x="114" y="2" width="72" height="34" rx="5" fill="#FFF8F2" stroke="#3B1A08" stroke-width="2.5"/>
+    <text x="150" y="25" font-family="'Segoe UI',Arial,sans-serif" font-size="18" font-weight="700"
+          fill="#3B1A08" text-anchor="middle" letter-spacing="0.5">mart</text>
+  </svg>
   <span class="sub">Rebate Debit Note Dashboard</span>
   <span id="gmail-status">⚙ Gmail not set</span>
   <button class="tl" onclick="openGmail()">⚙ Gmail Settings</button>
@@ -493,7 +510,7 @@ td{padding:9px 12px;vertical-align:middle;}
   <button class="blu" id="dl-all-btn" onclick="dlAll()">⬇ Download All (ZIP)</button>
   <div class="sep"></div>
   <div id="pw">
-    <div style="font-size:12px;color:#9999CC;" id="pl">Working…</div>
+    <div style="font-size:12px;color:#666;" id="pl">Working…</div>
     <div class="pbar"><div class="fill" id="pb" style="width:0%"></div></div>
   </div>
   <button class="out" onclick="loadRows()">↺ Refresh</button>
@@ -525,17 +542,40 @@ td{padding:9px 12px;vertical-align:middle;}
 <!-- Gmail Settings Modal -->
 <div id="gmodal"><div id="gmodal-inner">
   <h3>⚙ Gmail Settings</h3>
-  <div class="field">
-    <label>Gmail Address</label>
-    <input type="email" id="g-user" placeholder="yourname@gmail.com"/>
+  <!-- Mode tabs -->
+  <div style="display:flex;gap:8px;margin-bottom:20px;">
+    <button id="tab-browser" onclick="setTab('browser')" style="flex:1;padding:10px;border-radius:8px;border:2px solid var(--tl);background:var(--tl);color:#fff;font-weight:700;cursor:pointer;font-size:13px;">
+      🌐 Use Chrome Gmail<br><span style="font-weight:400;font-size:11px;opacity:.85;">Already signed in</span>
+    </button>
+    <button id="tab-smtp" onclick="setTab('smtp')" style="flex:1;padding:10px;border-radius:8px;border:2px solid var(--bdr);background:transparent;color:#CCC;cursor:pointer;font-size:13px;">
+      🔑 App Password<br><span style="font-weight:400;font-size:11px;opacity:.85;">Gmail SMTP</span>
+    </button>
   </div>
-  <div class="field">
-    <label>Gmail App Password</label>
-    <input type="password" id="g-pass" placeholder="xxxx xxxx xxxx xxxx"/>
-    <div class="hint">
-      Use an <strong>App Password</strong>, not your regular password.<br>
-      Get it at: <a href="https://myaccount.google.com/apppasswords" target="_blank">myaccount.google.com/apppasswords</a><br>
-      (Requires 2-Step Verification enabled on your Google account)
+  <!-- Browser mode info -->
+  <div id="panel-browser">
+    <div class="field">
+      <label>Your Gmail Address</label>
+      <input type="email" id="g-user-browser" placeholder="yourname@gmail.com"/>
+    </div>
+    <div class="hint" style="margin-top:4px;">
+      ✅ No password needed — emails open in your <strong>signed-in Gmail</strong> in a new tab.<br>
+      PDF downloads automatically. Just attach it and click Send in Gmail.
+    </div>
+  </div>
+  <!-- SMTP mode -->
+  <div id="panel-smtp" style="display:none;">
+    <div class="field">
+      <label>Gmail Address</label>
+      <input type="email" id="g-user-smtp" placeholder="yourname@gmail.com"/>
+    </div>
+    <div class="field">
+      <label>Gmail App Password</label>
+      <input type="password" id="g-pass" placeholder="xxxx xxxx xxxx xxxx"/>
+      <div class="hint">
+        Use an <strong>App Password</strong>, not your regular password.<br>
+        Get it at: <a href="https://myaccount.google.com/apppasswords" target="_blank">myaccount.google.com/apppasswords</a><br>
+        (Requires 2-Step Verification enabled on your Google account)
+      </div>
     </div>
   </div>
   <div style="display:flex;gap:10px;margin-top:18px;">
@@ -572,10 +612,10 @@ function render(){
   b.innerHTML=rows.map((r,i)=>`
   <tr id="tr-${i}">
     <td><input type="checkbox" class="rc" data-idx="${i}"></td>
-    <td style="color:#888">${r.si_no}</td>
+    <td style="color:#666">${r.si_no}</td>
     <td><strong>${r.supplier}</strong></td>
     <td style="color:#CCC;font-size:12px">${r.dn_number||''}</td>
-    <td style="font-size:11px;color:#9999CC;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.email}">${r.email}</td>
+    <td style="font-size:11px;color:#555;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${r.email}">${r.email}</td>
     <td>${r.pdf_exists?'<span class="badge b-ok">✓ Ready</span>':'<span class="badge b-no">Pending</span>'}</td>
     <td>${r.email_sent?'<span class="badge b-ok">✓ Sent</span>':'<span class="badge b-wait">Not sent</span>'}</td>
     <td class="acts">
@@ -649,26 +689,58 @@ function dlOne(pn){window.open(`/download/${SID}/${encodeURIComponent(pn)}`,'_bl
 function dlAll(){window.open(`/download-all/${SID}`,'_blank');}
 
 /* Send email */
+let _gmailMode='browser';
+function gmailComposeUrl(to,cc,subject,body){
+  const p=new URLSearchParams({view:'cm',to,cc,su:subject,body});
+  return 'https://mail.google.com/mail/?'+p.toString();
+}
 async function sendOne(i){
   const row=rows[i];
   if(!row.pdf_exists){toast('Generate first',true);return;}
   const btn=document.getElementById(`mb-${i}`);
   btn.innerHTML='<span class="spin"></span>';btn.disabled=true;
-  const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
-  if(res.ok){rows[i].email_sent=true;toast('✓ Email sent to '+row.email);}
-  else toast('Email error: '+res.error,true);
-  btn.innerHTML='📧';btn.disabled=false;render();cards();
+  const subject=`Rebate Debit Note ${row.dn_number||''} - DH Store Bahrain (tMart)`.trim();
+  const body=`Dear ${row.supplier},\n\nPlease find attached your Rebate Debit Note.\n\nRegards,\ntMart Finance Team`;
+  if(_gmailMode==='browser'){
+    window.open(`/download/${SID}/${encodeURIComponent(row.pdf_name)}`,'_blank');
+    setTimeout(()=>window.open(gmailComposeUrl(row.email,row.cc,subject,body),'_blank'),800);
+    rows[i].email_sent=true;
+    toast('📥 PDF downloaded — attach it in the Gmail tab that opened');
+    btn.innerHTML='📧';btn.disabled=false;render();cards();
+  } else {
+    const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
+    if(res.ok){rows[i].email_sent=true;toast('✓ Email sent to '+row.email);}
+    else toast('Email error: '+res.error,true);
+    btn.innerHTML='📧';btn.disabled=false;render();cards();
+  }
 }
 async function sendAll(){
   const s=sel().filter(r=>r.pdf_exists);
   if(!s.length){toast('No PDFs ready',true);return;}
-  prog(0,s.length,'Sending emails…');let done=0,err=0;
-  for(const row of s){
-    const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
-    done++;if(res.ok){const m=rows.find(r=>r.pdf_name===row.pdf_name);if(m)m.email_sent=true;}else err++;
-    prog(done,s.length,`Sending… ${done}/${s.length}`);
+  if(_gmailMode==='browser'){
+    // Download all + open compose tabs (max 5 at once to avoid popup blocking)
+    window.open(`/download-all/${SID}`,'_blank');
+    await new Promise(r=>setTimeout(r,1000));
+    let opened=0;
+    for(const row of s){
+      const subject=`Rebate Debit Note ${row.dn_number||''} - DH Store Bahrain (tMart)`.trim();
+      const body=`Dear ${row.supplier},\n\nPlease find attached your Rebate Debit Note.\n\nRegards,\ntMart Finance Team`;
+      window.open(gmailComposeUrl(row.email,row.cc,subject,body),'_blank');
+      const m=rows.find(r=>r.pdf_name===row.pdf_name);if(m)m.email_sent=true;
+      opened++;
+      if(opened>=5){await new Promise(r=>setTimeout(r,500));} // brief pause
+    }
+    toast(`📥 All PDFs downloaded (ZIP) — ${s.length} Gmail tabs opened. Attach PDF to each and send.`);
+    render();cards();
+  } else {
+    prog(0,s.length,'Sending emails…');let done=0,err=0;
+    for(const row of s){
+      const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
+      done++;if(res.ok){const m=rows.find(r=>r.pdf_name===row.pdf_name);if(m)m.email_sent=true;}else err++;
+      prog(done,s.length,`Sending… ${done}/${s.length}`);
+    }
+    hideProg();toast(err===0?`✓ ${done} emails sent`:`${done-err} sent, ${err} failed`,err>0);render();cards();
   }
-  hideProg();toast(err===0?`✓ ${done} emails sent`:`${done-err} sent, ${err} failed`,err>0);render();cards();
 }
 
 /* Delete */
@@ -700,26 +772,52 @@ async function uploadTemplate(inp){
 }
 
 /* Gmail settings */
+function setTab(mode){
+  _gmailMode=mode;
+  const isBrowser=mode==='browser';
+  document.getElementById('panel-browser').style.display=isBrowser?'':'none';
+  document.getElementById('panel-smtp').style.display=isBrowser?'none':'';
+  document.getElementById('tab-browser').style.cssText=isBrowser
+    ?'flex:1;padding:10px;border-radius:8px;border:2px solid var(--tl);background:var(--tl);color:#fff;font-weight:700;cursor:pointer;font-size:13px;'
+    :'flex:1;padding:10px;border-radius:8px;border:2px solid var(--bdr);background:transparent;color:#CCC;cursor:pointer;font-size:13px;';
+  document.getElementById('tab-smtp').style.cssText=isBrowser
+    ?'flex:1;padding:10px;border-radius:8px;border:2px solid var(--bdr);background:transparent;color:#CCC;cursor:pointer;font-size:13px;'
+    :'flex:1;padding:10px;border-radius:8px;border:2px solid var(--tl);background:var(--tl);color:#fff;font-weight:700;cursor:pointer;font-size:13px;';
+}
 async function checkGmail(){
   const r=await fetch('/api/gmail-status').then(r=>r.json());
+  _gmailMode=r.mode||'browser';
   const el=document.getElementById('gmail-status');
-  if(r.configured){el.textContent='✓ Gmail: '+r.user;el.className='ok';}
-  else{el.textContent='⚠ Gmail not set';el.className='';}
+  if(r.configured){
+    const icon=r.mode==='browser'?'🌐':'🔑';
+    el.textContent=icon+' Gmail: '+r.user;el.className='ok';
+  } else{el.textContent='⚠ Gmail not set';el.className='';}
 }
 function openGmail(){
   fetch('/api/gmail-status').then(r=>r.json()).then(r=>{
-    if(r.configured) document.getElementById('g-user').value=r.user;
+    const mode=r.mode||'browser';
+    setTab(mode);
+    if(r.user){
+      document.getElementById('g-user-browser').value=r.user;
+      document.getElementById('g-user-smtp').value=r.user;
+    }
   });
   document.getElementById('gmodal').classList.add('show');
 }
 function closeGmail(){document.getElementById('gmodal').classList.remove('show');}
 async function saveGmail(){
-  const user=document.getElementById('g-user').value.trim();
-  const pass=document.getElementById('g-pass').value.trim();
-  if(!user||!pass){toast('Enter Gmail and App Password',true);return;}
-  const res=await post('/api/gmail-settings',{user,password:pass});
-  if(res.ok){toast('✓ Gmail saved: '+res.user);checkGmail();closeGmail();}
-  else toast('Error: '+res.error,true);
+  const isBrowser=_gmailMode==='browser';
+  const user=(isBrowser
+    ?document.getElementById('g-user-browser')
+    :document.getElementById('g-user-smtp')).value.trim();
+  const pass=isBrowser?'':document.getElementById('g-pass').value.trim();
+  if(!user){toast('Enter your Gmail address',true);return;}
+  if(!isBrowser&&!pass){toast('Enter your App Password',true);return;}
+  const res=await post('/api/gmail-settings',{mode:_gmailMode,user,password:pass});
+  if(res.ok){
+    toast(isBrowser?'✓ Chrome Gmail set: '+res.user:'✓ Gmail SMTP saved: '+res.user);
+    checkGmail();closeGmail();
+  } else toast('Error: '+res.error,true);
 }
 
 /* Helpers */
