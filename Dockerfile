@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # App files
 COPY cloud_app.py .
-COPY "DN_INVOICE _FORMAT.docx" .
+COPY ["DN_INVOICE _FORMAT.docx", "."]
 
 # LibreOffice profile dir (must be writable at runtime)
 RUN mkdir -p /tmp/lo_profile && chmod 777 /tmp/lo_profile
