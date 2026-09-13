@@ -3,15 +3,15 @@ tMart Rebate DN Dashboard — Cloud Edition
 ==========================================
 • Runs on Render.com (free tier) with LibreOffice for PDF conversion
 • Each colleague gets their own private session
-• Email auto-sent via Gmail API (OAuth) or Gmail SMTP (App Password)
+• Email auto-sent via Gmail OAuth (popup sign-in) or App Password
 """
 
 import os, re, io, json, uuid, shutil, tempfile, zipfile, threading, datetime
-import smtplib, urllib.request as urlreq, base64 as b64lib
+import smtplib, urllib.request as urlreq, urllib.parse, base64 as b64lib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text       import MIMEText
 from email.mime.application import MIMEApplication
-from flask import Flask, jsonify, send_file, request, session
+from flask import Flask, jsonify, send_file, request, session, redirect
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "tmart-dn-cloud-change-this-secret")
@@ -19,6 +19,14 @@ app.secret_key = os.environ.get("SECRET_KEY", "tmart-dn-cloud-change-this-secret
 BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(tempfile.gettempdir(), "tmart_sessions")
 os.makedirs(SESSIONS_DIR, exist_ok=True)
+
+# Google OAuth config — set these as Render environment variables
+GOOGLE_CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+GOOGLE_AUTH_URL      = "https://accounts.google.com/o/oauth2/auth"
+GOOGLE_TOKEN_URL     = "https://oauth2.googleapis.com/token"
+GMAIL_USERINFO_URL   = "https://www.googleapis.com/oauth2/v1/userinfo"
+GMAIL_SEND_URL       = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 
 # ── Session helpers ────────────────────────────────────────────────────────────
 
@@ -158,43 +166,34 @@ def convert_to_pdf(docx_path, pdf_path):
             return False, r.stderr or "LibreOffice: PDF not created"
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
-
-    td = docx_path.replace('"', '`"')
-    op = pdf_path.replace('"',  '`"')
+    td = docx_path.replace('"', '`"'); op = pdf_path.replace('"', '`"')
     ps = (f'$w=New-Object -ComObject Word.Application;$w.Visible=$false;$w.DisplayAlerts=0;'
-          f'$d=$w.Documents.Open("{td}");$d.ExportAsFixedFormat("{op}",17);'
-          f'$d.Close($false);$w.Quit()')
-    r = subprocess.run(["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps],
-                       capture_output=True, text=True, timeout=120)
-    if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0:
-        return True, None
+          f'$d=$w.Documents.Open("{td}");$d.ExportAsFixedFormat("{op}",17);$d.Close($false);$w.Quit()')
+    import subprocess
+    r = subprocess.run(["powershell","-ExecutionPolicy","Bypass","-Command",ps],capture_output=True,text=True,timeout=120)
+    if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 0: return True, None
     return False, r.stderr or "Word COM: PDF not created"
 
-# ── Single PDF generation ──────────────────────────────────────────────────────
+# ── PDF generation ─────────────────────────────────────────────────────────────
 
 def generate_one(row, sid=None):
     tmpl = template_path(sid)
     if not tmpl:
-        return {"pdf_name": pdf_name(row), "ok": False,
-                "error": "No template — upload DN_INVOICE _FORMAT.docx"}
-    pn       = pdf_name(row)
-    od       = outdir(sid)
-    out_pdf  = os.path.join(od, pn)
-    temp_doc = os.path.join(od, pn.replace(".pdf", "_filled.docx"))
+        return {"pdf_name": pdf_name(row), "ok": False, "error": "No template"}
+    pn = pdf_name(row); od = outdir(sid)
+    out_pdf = os.path.join(od, pn); temp_doc = os.path.join(od, pn.replace(".pdf","_filled.docx"))
     try:
         fill_template(tmpl, temp_doc, row)
         ok, err = convert_to_pdf(temp_doc, out_pdf)
         if ok and os.path.exists(out_pdf) and os.path.getsize(out_pdf) > 0:
-            return {"pdf_name": pn, "ok": True,  "error": None}
-        return  {"pdf_name": pn, "ok": False, "error": err or "PDF empty"}
+            return {"pdf_name": pn, "ok": True, "error": None}
+        return {"pdf_name": pn, "ok": False, "error": err or "PDF empty"}
     except Exception as e:
-        return  {"pdf_name": pn, "ok": False, "error": str(e)}
+        return {"pdf_name": pn, "ok": False, "error": str(e)}
     finally:
         try:
             if os.path.exists(temp_doc): os.remove(temp_doc)
         except: pass
-
-# ── Background batch generation ────────────────────────────────────────────────
 
 _jobs = {}
 
@@ -203,12 +202,10 @@ def _run_batch(sid, rows_list):
     for row in rows_list:
         if status.get("cancelled"): break
         r = generate_one(row, sid=sid)
-        status["done"]   += 1
-        status["results"].append(r)
+        status["done"] += 1; status["results"].append(r)
         if not r["ok"]: status["errors"].append(r)
         _write_job(sid, status)
-    status["running"] = False
-    _write_job(sid, status)
+    status["running"] = False; _write_job(sid, status)
 
 def _write_job(sid, status):
     path = os.path.join(SESSIONS_DIR, sid, "job.json")
@@ -222,31 +219,11 @@ def _read_job(sid):
     except:
         return {"total":0,"done":0,"running":False,"results":[],"errors":[]}
 
-# ── Gmail SMTP ─────────────────────────────────────────────────────────────────
+# ── Gmail send helpers ─────────────────────────────────────────────────────────
 
-def send_gmail_smtp(to, cc, subject, body_text, attachment_path, gmail_user, gmail_pass):
+def _build_mime(to, cc, subject, body_text, pdf_path):
     msg = MIMEMultipart()
-    msg["From"]    = gmail_user
-    msg["To"]      = to
-    msg["CC"]      = cc
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body_text, "plain"))
-    if attachment_path and os.path.exists(attachment_path):
-        with open(attachment_path, "rb") as f:
-            part = MIMEApplication(f.read(), Name=os.path.basename(attachment_path))
-        part["Content-Disposition"] = f'attachment; filename="{os.path.basename(attachment_path)}"'
-        msg.attach(part)
-    recipients = [a.strip() for a in (to + ";" + cc).split(";") if a.strip()]
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
-        s.login(gmail_user, gmail_pass)
-        s.sendmail(gmail_user, recipients, msg.as_string())
-
-# ── Gmail API (OAuth) ──────────────────────────────────────────────────────────
-
-def send_gmail_oauth(access_token, to, cc, subject, body_text, pdf_path):
-    """Send email via Gmail API using an OAuth2 access token."""
-    msg = MIMEMultipart()
-    msg["To"]      = to
+    msg["To"] = to
     if cc: msg["CC"] = cc
     msg["Subject"] = subject
     msg.attach(MIMEText(body_text, "plain"))
@@ -255,138 +232,224 @@ def send_gmail_oauth(access_token, to, cc, subject, body_text, pdf_path):
             part = MIMEApplication(f.read(), Name=os.path.basename(pdf_path))
         part["Content-Disposition"] = f'attachment; filename="{os.path.basename(pdf_path)}"'
         msg.attach(part)
+    return msg
+
+def send_gmail_smtp(to, cc, subject, body_text, pdf_path, gmail_user, gmail_pass):
+    msg = _build_mime(to, cc, subject, body_text, pdf_path)
+    msg["From"] = gmail_user
+    recipients = [a.strip() for a in (to + ";" + cc).split(";") if a.strip()]
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(gmail_user, gmail_pass)
+        s.sendmail(gmail_user, recipients, msg.as_string())
+
+def send_gmail_api(access_token, to, cc, subject, body_text, pdf_path):
+    msg = _build_mime(to, cc, subject, body_text, pdf_path)
     raw = b64lib.urlsafe_b64encode(msg.as_bytes()).decode().rstrip("=")
     payload = json.dumps({"raw": raw}).encode()
-    req = urlreq.Request(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
-        data=payload,
-        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-    )
+    req = urlreq.Request(GMAIL_SEND_URL, data=payload,
+                         headers={"Authorization": f"Bearer {access_token}",
+                                  "Content-Type": "application/json"})
     try:
         with urlreq.urlopen(req, timeout=30) as resp:
             return True, json.loads(resp.read()).get("id", "sent")
     except Exception as e:
-        err_body = ""
-        if hasattr(e, 'read'):
-            try: err_body = json.loads(e.read()).get("error", {}).get("message", "")
+        err = ""
+        if hasattr(e, "read"):
+            try: err = json.loads(e.read()).get("error", {}).get("message", "")
             except: pass
-        return False, err_body or str(e)
+        return False, err or str(e)
+
+# ── OAuth helpers ──────────────────────────────────────────────────────────────
+
+def _get_redirect_uri():
+    base = request.host_url.rstrip("/")
+    return base + "/auth/google/callback"
+
+def _get_valid_token():
+    """Return a valid OAuth access token from session, refreshing if expired."""
+    access_token   = session.get("oauth_access_token", "")
+    refresh_token  = session.get("oauth_refresh_token", "")
+    expiry_str     = session.get("oauth_expiry", "")
+    if not access_token:
+        return None
+    if expiry_str:
+        try:
+            expiry = datetime.datetime.fromisoformat(expiry_str)
+            if datetime.datetime.now() >= expiry and refresh_token and GOOGLE_CLIENT_SECRET:
+                data = urllib.parse.urlencode({
+                    "refresh_token": refresh_token,
+                    "client_id": GOOGLE_CLIENT_ID,
+                    "client_secret": GOOGLE_CLIENT_SECRET,
+                    "grant_type": "refresh_token"
+                }).encode()
+                req = urlreq.Request(GOOGLE_TOKEN_URL, data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+                with urlreq.urlopen(req, timeout=30) as resp:
+                    tok = json.loads(resp.read())
+                access_token = tok["access_token"]
+                session["oauth_access_token"] = access_token
+                session["oauth_expiry"] = (datetime.datetime.now() +
+                    datetime.timedelta(seconds=tok.get("expires_in", 3600) - 60)).isoformat()
+        except: pass
+    return access_token
+
+# ── API: OAuth flow ────────────────────────────────────────────────────────────
+
+@app.route("/auth/google")
+def auth_google():
+    if not GOOGLE_CLIENT_ID:
+        return ("<html><body style='font-family:sans-serif;padding:30px'>"
+                "<h2 style='color:#E05500'>⚠ Google OAuth Not Configured</h2>"
+                "<p>Ask IT to add <b>GOOGLE_CLIENT_ID</b> and <b>GOOGLE_CLIENT_SECRET</b> "
+                "as environment variables on Render.</p>"
+                "<p>The Redirect URI to register in Google Cloud Console is:<br>"
+                f"<code style='background:#eee;padding:4px 8px'>{request.host_url.rstrip('/')}/auth/google/callback</code></p>"
+                "</body></html>"), 500
+    params = urllib.parse.urlencode({
+        "client_id":     GOOGLE_CLIENT_ID,
+        "redirect_uri":  _get_redirect_uri(),
+        "scope":         "https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email",
+        "response_type": "code",
+        "access_type":   "offline",
+        "prompt":        "consent",
+        "state":         get_sid()
+    })
+    return redirect(GOOGLE_AUTH_URL + "?" + params)
+
+@app.route("/auth/google/callback")
+def auth_google_callback():
+    code  = request.args.get("code", "")
+    error = request.args.get("error", "")
+    CLOSE = "<html><body><script>window.opener&&window.opener.postMessage({t},{o});setTimeout(()=>window.close(),400);</script><p>{m}</p></body></html>"
+
+    if error:
+        return CLOSE.format(t=json.dumps({"ok":False,"error":error}), o="'*'", m=f"Error: {error}")
+    if not code:
+        return CLOSE.format(t=json.dumps({"ok":False,"error":"No code"}), o="'*'", m="No code returned")
+
+    try:
+        # Exchange code for tokens
+        data = urllib.parse.urlencode({
+            "code": code, "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "redirect_uri": _get_redirect_uri(), "grant_type": "authorization_code"
+        }).encode()
+        req = urlreq.Request(GOOGLE_TOKEN_URL, data=data,
+                             headers={"Content-Type": "application/x-www-form-urlencoded"})
+        with urlreq.urlopen(req, timeout=30) as resp:
+            tok = json.loads(resp.read())
+
+        access_token  = tok["access_token"]
+        refresh_token = tok.get("refresh_token", session.get("oauth_refresh_token", ""))
+
+        # Get user email
+        req2 = urlreq.Request(GMAIL_USERINFO_URL, headers={"Authorization": f"Bearer {access_token}"})
+        with urlreq.urlopen(req2, timeout=10) as resp2:
+            info = json.loads(resp2.read())
+        email = info.get("email", "")
+
+        # Store in session
+        session["gmail_mode"]          = "oauth"
+        session["gmail_user"]          = email
+        session["gmail_pass"]          = ""
+        session["oauth_access_token"]  = access_token
+        session["oauth_refresh_token"] = refresh_token
+        session["oauth_expiry"]        = (datetime.datetime.now() +
+            datetime.timedelta(seconds=tok.get("expires_in", 3600) - 60)).isoformat()
+
+        msg = json.dumps({"ok": True, "email": email})
+        return CLOSE.format(t=msg, o="'*'",
+                            m=f"✅ Connected as {email}. Closing…")
+    except Exception as e:
+        err = str(e)
+        return CLOSE.format(t=json.dumps({"ok":False,"error":err}), o="'*'", m=f"Error: {err}")
 
 # ── API routes ─────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def index():
-    return DASHBOARD_HTML
+def index(): return DASHBOARD_HTML
 
 @app.route("/api/session-id")
-def api_session_id():
-    return jsonify({"sid": get_sid()})
+def api_session_id(): return jsonify({"sid": get_sid()})
 
 @app.route("/api/rows")
 def api_rows():
     rows = read_excel()
-    if isinstance(rows, dict):
-        return jsonify({"ok": False, "error": rows["error"]})
-    od   = outdir()
-    sent = session.get("sent", {})
+    if isinstance(rows, dict): return jsonify({"ok": False, "error": rows["error"]})
+    od = outdir(); sent = session.get("sent", {})
     result = []
     for i, row in enumerate(rows):
         pn = pdf_name(row)
         result.append({
-            "idx":        i,
-            "si_no":      row.get("_row_idx", str(i+1)),
-            "supplier":   col(row, "Supplier name"),
-            "dn_number":  col(row, "Debit note number"),
-            "email":      col(row, "Email") or col(row, "email"),
-            "cc":         col(row, "cc") or col(row, "CC") or col(row, "Cc") or "",
-            "pdf_name":   pn,
-            "pdf_exists": os.path.exists(os.path.join(od, pn)),
-            "email_sent": sent.get(pn, False),
-            "row":        row,
+            "idx": i, "si_no": row.get("_row_idx", str(i+1)),
+            "supplier": col(row, "Supplier name"), "dn_number": col(row, "Debit note number"),
+            "email": col(row, "Email") or col(row, "email"),
+            "cc": col(row, "cc") or col(row, "CC") or col(row, "Cc") or "",
+            "pdf_name": pn, "pdf_exists": os.path.exists(os.path.join(od, pn)),
+            "email_sent": sent.get(pn, False), "row": row,
         })
     return jsonify({"ok": True, "rows": result})
 
 @app.route("/api/generate-start", methods=["POST"])
 def api_generate_start():
-    body      = request.json or {}
-    rows_list = [item["row"] for item in body.get("rows", [])]
-    sid       = get_sid()
-    status    = {"total": len(rows_list), "done": 0, "running": True,
-                 "results": [], "errors": [], "cancelled": False}
-    _jobs[sid] = status
-    _write_job(sid, status)
-    t = threading.Thread(target=_run_batch, args=(sid, rows_list), daemon=True)
-    t.start()
+    body = request.json or {}; rows_list = [item["row"] for item in body.get("rows", [])]
+    sid  = get_sid()
+    status = {"total": len(rows_list), "done": 0, "running": True, "results": [], "errors": [], "cancelled": False}
+    _jobs[sid] = status; _write_job(sid, status)
+    threading.Thread(target=_run_batch, args=(sid, rows_list), daemon=True).start()
     return jsonify({"ok": True, "total": len(rows_list)})
 
 @app.route("/api/generate-status")
-def api_generate_status():
-    return jsonify(_read_job(get_sid()))
+def api_generate_status(): return jsonify(_read_job(get_sid()))
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
-    body      = request.json or {}
-    rows_list = [item["row"] for item in body.get("rows", [])]
-    sid = get_sid()
-    results   = [generate_one(r, sid=sid) for r in rows_list]
-    return jsonify({"results": results})
+    body = request.json or {}; rows_list = [item["row"] for item in body.get("rows", [])]
+    sid  = get_sid()
+    return jsonify({"results": [generate_one(r, sid=sid) for r in rows_list]})
 
 @app.route("/api/send-email", methods=["POST"])
 def api_send_email():
-    """SMTP App Password mode."""
     body = request.json or {}
     pn   = body.get("pdf_name", "")
     pdf_path = os.path.join(outdir(), pn)
     if not os.path.exists(pdf_path):
         return jsonify({"ok": False, "error": "PDF not found — generate it first"})
-    gu = session.get("gmail_user", "")
-    gp = session.get("gmail_pass", "")
-    if not gu or not gp:
-        return jsonify({"ok": False, "error": "Gmail not configured — click ⚙ Gmail Settings"})
-    try:
-        to       = body.get("email", "")
-        cc       = body.get("cc", "")
-        supplier = body.get("supplier", "Supplier")
-        dn_num   = body.get("dn_number", "")
-        subject  = f"Rebate Debit Note {dn_num} - DH Store Bahrain (tMart)".strip()
-        body_t   = (f"Dear {supplier},\n\n"
-                    "Please find attached your Rebate Debit Note.\n\n"
-                    "Regards,\ntMart Finance Team")
-        send_gmail_smtp(to, cc, subject, body_t, pdf_path, gu, gp)
-        sent = session.get("sent", {}); sent[pn] = True; session["sent"] = sent
-        return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
 
-@app.route("/api/send-oauth-email", methods=["POST"])
-def api_send_oauth_email():
-    """Gmail API OAuth mode — access_token comes from the browser (Google Identity Services)."""
-    body         = request.json or {}
-    access_token = body.get("access_token", "")
-    pn           = body.get("pdf_name", "")
-    if not access_token:
-        return jsonify({"ok": False, "error": "No OAuth token — click Sign in with Google"})
-    pdf_path = os.path.join(outdir(), pn)
-    if not os.path.exists(pdf_path):
-        return jsonify({"ok": False, "error": "PDF not found — generate it first"})
     to       = body.get("email", "")
     cc       = body.get("cc", "")
     supplier = body.get("supplier", "Supplier")
     dn_num   = body.get("dn_number", "")
     subject  = f"Rebate Debit Note {dn_num} - DH Store Bahrain (tMart)".strip()
-    body_t   = (f"Dear {supplier},\n\n"
-                "Please find attached your Rebate Debit Note.\n\n"
-                "Regards,\ntMart Finance Team")
-    ok, result = send_gmail_oauth(access_token, to, cc, subject, body_t, pdf_path)
+    body_t   = (f"Dear {supplier},\n\nPlease find attached your Rebate Debit Note.\n\nRegards,\ntMart Finance Team")
+
+    mode = session.get("gmail_mode", "smtp")
+
+    if mode == "oauth":
+        token = _get_valid_token()
+        if not token:
+            return jsonify({"ok": False, "error": "Gmail not connected — click Connect Gmail"})
+        ok, result = send_gmail_api(token, to, cc, subject, body_t, pdf_path)
+    elif mode == "smtp":
+        gu = session.get("gmail_user", ""); gp = session.get("gmail_pass", "")
+        if not gu or not gp:
+            return jsonify({"ok": False, "error": "Gmail not configured — click ⚙ Gmail Settings"})
+        try:
+            send_gmail_smtp(to, cc, subject, body_t, pdf_path, gu, gp)
+            ok, result = True, "sent"
+        except Exception as e:
+            ok, result = False, str(e)
+    else:
+        return jsonify({"ok": False, "error": "Use browser mode from the frontend"})
+
     if ok:
         sent = session.get("sent", {}); sent[pn] = True; session["sent"] = sent
-        return jsonify({"ok": True, "message_id": result})
+        return jsonify({"ok": True})
     return jsonify({"ok": False, "error": result})
 
 @app.route("/api/gmail-settings", methods=["POST"])
 def api_gmail_settings():
-    body = request.json or {}
-    mode = body.get("mode", "smtp")
+    body = request.json or {}; mode = body.get("mode", "smtp")
     session["gmail_mode"] = mode
     session["gmail_user"] = body.get("user", "").strip()
     session["gmail_pass"] = body.get("password", "").strip() if mode == "smtp" else ""
@@ -396,8 +459,13 @@ def api_gmail_settings():
 def api_gmail_status():
     mode = session.get("gmail_mode", "")
     user = session.get("gmail_user", "")
-    configured = bool(user) if mode in ("browser", "oauth") else bool(user and session.get("gmail_pass"))
-    return jsonify({"configured": configured, "user": user, "mode": mode})
+    has_oauth = bool(session.get("oauth_access_token"))
+    oauth_configured = bool(GOOGLE_CLIENT_ID)
+    if mode == "oauth": configured = has_oauth
+    elif mode == "smtp": configured = bool(user and session.get("gmail_pass"))
+    else: configured = bool(user)
+    return jsonify({"configured": configured, "user": user, "mode": mode,
+                    "has_oauth": has_oauth, "oauth_configured": oauth_configured})
 
 @app.route("/api/upload-excel", methods=["POST"])
 def api_upload_excel():
@@ -405,22 +473,19 @@ def api_upload_excel():
         import openpyxl
         f = request.files.get("file")
         if not f: return jsonify({"ok": False, "error": "No file"})
-        dest = excel_path()
-        f.save(dest)
+        dest = excel_path(); f.save(dest)
         wb = openpyxl.load_workbook(dest, data_only=True)
         sheets = wb.sheetnames; wb.close()
         if "Sheet1" not in sheets:
             return jsonify({"ok": False, "error": f"Sheet1 not found. Available: {sheets}"})
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    except Exception as e: return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/api/upload-template", methods=["POST"])
 def api_upload_template():
     f = request.files.get("file")
     if not f: return jsonify({"ok": False, "error": "No file"})
-    f.save(sfile("template.docx"))
-    return jsonify({"ok": True})
+    f.save(sfile("template.docx")); return jsonify({"ok": True})
 
 @app.route("/api/template-status")
 def api_template_status():
@@ -441,15 +506,14 @@ def download(sid, filename):
 
 @app.route("/download-all/<sid>")
 def download_all(sid):
-    od   = os.path.join(SESSIONS_DIR, sid, "output")
+    od = os.path.join(SESSIONS_DIR, sid, "output")
     pdfs = [f for f in os.listdir(od) if f.endswith(".pdf")] if os.path.exists(od) else []
     if not pdfs: return jsonify({"error": "No PDFs yet"}), 404
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for f in pdfs: zf.write(os.path.join(od, f), f)
     buf.seek(0)
-    return send_file(buf, mimetype="application/zip",
-                     as_attachment=True, download_name="Rebate_DNs.zip")
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name="Rebate_DNs.zip")
 
 @app.route("/api/delete/<path:filename>", methods=["DELETE"])
 def delete_pdf(filename):
@@ -457,8 +521,7 @@ def delete_pdf(filename):
     try:
         if os.path.exists(path): os.remove(path)
         return jsonify({"ok": True})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)})
+    except Exception as e: return jsonify({"ok": False, "error": str(e)})
 
 # ── Dashboard HTML ─────────────────────────────────────────────────────────────
 
@@ -468,7 +531,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>tMart – Rebate DN Dashboard</title>
-<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
 :root{--or:#E05500;--dark:#F0F2F5;--card:#FFFFFF;--bdr:#D8DBE8;--grn:#16A34A;--red:#DC2626;--blu:#2563EB;--pur:#7C3AED;--tl:#0D9488;}
 *{box-sizing:border-box;margin:0;padding:0;}
@@ -501,7 +563,6 @@ td{padding:9px 12px;vertical-align:middle;}
 .toast.err{border-color:var(--red);}@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1}}
 #pw{display:none;min-width:220px;}.pbar{height:6px;background:var(--bdr);border-radius:3px;overflow:hidden;margin-top:6px;}
 .pbar .fill{height:100%;background:var(--or);transition:width .4s;}
-/* Modals */
 #modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center;}
 #modal.show{display:flex;}
 #modal-inner{background:var(--card);border-radius:12px;width:90%;max-width:900px;height:82vh;display:flex;flex-direction:column;overflow:hidden;}
@@ -510,7 +571,7 @@ td{padding:9px 12px;vertical-align:middle;}
 #modal-frame{flex:1;border:none;}
 #gmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1001;align-items:center;justify-content:center;}
 #gmodal.show{display:flex;}
-#gmodal-inner{background:var(--card);border-radius:14px;width:480px;max-height:90vh;overflow-y:auto;padding:28px;box-shadow:0 8px 40px rgba(0,0,0,.4);}
+#gmodal-inner{background:var(--card);border-radius:14px;width:460px;max-height:90vh;overflow-y:auto;padding:28px;box-shadow:0 8px 40px rgba(0,0,0,.4);}
 #gmodal h3{color:var(--or);margin-bottom:16px;font-size:17px;}
 .tabs{display:flex;gap:6px;margin-bottom:18px;}
 .tab-btn{flex:1;padding:10px 6px;border-radius:8px;border:2px solid var(--bdr);background:transparent;color:#888;cursor:pointer;font-size:12px;font-weight:600;text-align:center;line-height:1.4;transition:all .15s;}
@@ -522,21 +583,19 @@ td{padding:9px 12px;vertical-align:middle;}
 .field input:focus{border-color:var(--or);}
 .hint{font-size:11px;color:#666;margin-top:5px;line-height:1.6;}
 .hint a{color:var(--tl);text-decoration:none;}
-.hint a:hover{text-decoration:underline;}
-#gstatus-bar{font-size:12px;padding:6px 12px;border-radius:6px;background:rgba(239,68,68,.1);color:var(--red);margin-bottom:14px;display:none;}
-#gstatus-bar.show{display:block;}
-#gstatus-bar.ok{background:rgba(34,197,94,.12);color:var(--grn);}
-#oauth-btn-wrap{margin:12px 0;}
-#oauth-connected{background:rgba(34,197,94,.1);border:1px solid var(--grn);border-radius:8px;padding:10px 14px;font-size:13px;color:var(--grn);display:none;margin:12px 0;}
+.connected-box{background:rgba(34,197,94,.1);border:1px solid var(--grn);border-radius:8px;padding:12px 16px;font-size:13px;color:var(--grn);margin-bottom:14px;}
+.google-btn{width:100%;padding:12px;background:#4285F4;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;margin:10px 0;}
+.google-btn:hover{background:#3367D6;}
+.google-btn svg{width:20px;height:20px;}
 </style>
 </head>
 <body>
 <div style="background:#fff;border-bottom:3px solid #FF6200;padding:8px 0;text-align:center;">
-  <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAVwAAAGBCAYAAAAqtgndAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAACyWSURBVHhe7d17cFXV/ffx9z7XXE8SyBmVu1xEoYog/OyjzoDWC1LUqUy9AY8dsWO1M2qrM/XSjtqrTq3l59S/OjBtFceieClWsYwVHe0jIuAVqRgVSLjlBjlJzv3s54/EoMuzJUDOOofk85pxxvPde2etITuf2Vlrryxnf0eXi4iIFJzPLIiISGEocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCWO67quWRQRkYGnJ1wREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIF7jOhYNYXtVzhsv8Jh11vm0cPw1sKer3PbH+gwj4lIQSlwjwmfEf/PR32f0v/vha8c/Sat/+uw/Yop7G0yj4iIbQrcY0HT06R2AmdfQxDgjRW0mufk9RmZHUbpf1YwdqXL2D/cRsQ4JCKFpcA9BnS8uYwc4Bv1a8JnAzxO0hhW+PKQQ8+wwwvsumI8iZ0AH5H4icP2/33h4JDC/x58Sjav3bnqs75jPU/IDrve+oy9t/We8+XhiC++Xp5rReSrFLgl74vhhFMIfftEhv+fa8AYVuhYNYX2vx8ccjgc+a7N/X3814Iz+/fv9oY3sPN2Dqz6DJr+wM4HH//KeSLiTYFb6r4YThi9hPKRwMgZPd+0vmGFF+jsDczg7W7PcMFKlxH/M48RKz+lbDTAKZT90WXsLfO+8qUPXtt7fKXL2Nt7Aj33n6e/MqmWG/MgY1e61F15Ss/nxi+H9MHrRy848Ut1EfkyBW6J+2I4gZ23036Fw/af3N7z+WvDCtcQ/p8vfz4c0wmM7P3f/1nYM068cxPpL50R/D89YR0ZPf1gceRtVJzNwSGLo32DQmSQU+CWtK++nWD66tsKZgAfjs1kvniL4a0VPUE7ekZP8B7C8Ft6nmy/ePJN/12vm4l4UeCWsi+GE7iGqt6hgi//2s+Oj+hgHlVfhN2DX540+/IX+tKk2Vd8ce3BJ9TtvWOywSv78RZD0x/Y2dte3zjwmFMOfZ3IEKXALWF9wwnm02bfr/3LiDdBZMGWvifMrzqR467sDWcPkQVbqDr7q7Xg7S4jjmR4YvSD1H1tnFhEvuC4ruuaRRERGXh6whURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglWvhwDNCeZgdpT7ND055mpUuBW+LiK+8k+dLDZtm68EU3U37F78xyn3V/TvP2qqxZLqiZC/zM+WH+nXMBlj6XYsW6o0xZDwvnBLj1spBZ7nP/h39j+SerzbJ11028hDumeu+Y27X0IeKPPWqWB1T5osVU3vpTszwkaUihhKXWryyJsAVIvvQwqfUrzTL0PtnaDluAt1dl+eiV/O2u2ZQtWNgCrFiXYc2m/G2vbny9JMIWYPknq1nd+LpZht4n20KHLUD8sUdJrHnRLA9JCtwSlly3zCwVlVd/3n0hf/DY4NX20/8pXNh+wauNJz5fa5aKyqs/iadXmaWCsdlWKVPglrDcZxvMUlF59WfP1pxZssar7Q+35w/igeTVxrvt28xSUXn1J/vB+2apYGy2VcoUuCXM5gRZf3j1p1ATZP3h1fbRTpD1h1cbNifI+sOrPwM1QdYfNtsqZQpcERFLFLhDQHDmmYSiUbMs0n91Eyifv5Dam25l2A0LqTpvOsEK8yQ5FL0WVsL2L6k0S4fNqRnGiHnfpvW1d0g07TIPH7baZV1miQfnJsySVbevKTNLzPpJt1nyNGVOFb+dGyJKjjdf7uSutRnyD5583YY/fj11Tnru+2bpkJ6ZfDeJcJCMmyXr5MiRw4eP4wL1vWc4BP1+ysJh1ra8yX1blxtf4Zt9fNmTZomWmdPNUh5hyhb/huiPLyRAEjfbMzTghKpxYpvZ/+vbaPt3i3lRXvVvbzZLQ46ecAe5immn4nMcsyx9HMJlPqLDfETr/UQri/NvNTpYx+SyMUytHM/plRM4I3IStemxRII1jKquY3TNMEYPG87I4fVcOe588/ICCuMbNYFABNyORtLbd5Levo9MdxKnfhSh42rMC+QbKHAHs5ETqa4JA+B6TPBYV+7ntB9VcdNTddzzyjB+9UbPf/e8VMvNSys5c8bQvCXTqQDxtjRuJsf2tgw/+Otufv9yB1f/pYUn34kTCARw3ACpWI62ZId5eQF1kGloIJsJ4x81gbIzplN2+hRCx0cg1kjy02bzAvkGQ/PuHgqCIUacPB5/3MFNOJAtzpPbV9QEOPtnVXxvcYhoKEfz7oOvdAWqfERnhZn7i0rOnz00b8tQZZDu1iy//OdezhlTwYXjwlw/o5IXP+hmw7YM6YSDi/3vo9udxM2C29xIuqmB9J5G0h1AJomb7O/gi6DAHbzcEafhdPog5uDuzVA/ZRojZ8+jeuTp5qmW+Djp6nLOme0j8WGKHXEf1UCi71VWl+ZNGRK1Qc6+voIzTrYfLKVgdyqDz/EzribIsx90sr8zy6n1fl5r6ARAEy7HNgXuIOVzK2htyZKLOeTaINecI72jnFjTO+apljhUR32U+SG214Vyh6qxPZ/7tGbZtx8CNQ511V+qDyFV4QAd8QypNIyOBPABLZ1ZqsL6UR0M9F0cpNwdr5FoWEvmQJZcDDKxMK1Nr5qnWZRl44o4G7fCCeeFGV9rHneomx1mfG2OLU8keH2DjWc5h+nfqeKeC4JEfb2f51Txp/khIuapltRXuMwY7vDmzi6iVQFW/reLzw9kuHRqNcHgof9CmZQ2Be4gl4tBrgMSB7rJpvr3+k7BfJpizf1dvPFqlvb9RqCmXGKNaTY+0sUzj6ex86KZy+ZNSV5tOtiXZEuaf2xOYXNaCsDJgeOG8QdquP3iSZwSybG7vZtzT/CzdP4oIo6fWGsKx3UI4v1XyqS0KXAHOTfmkKOGzs515qGiyHyaYs1dB3jo0nbuWxzj2UfiPH9vBw+c285Di2M8+5StsO3VnmLZC3H+tc8l2Z5mxeo4q5vMkwovl4qSaveRbHVJtrpcOnksPz9rPDecNpqyroP1tk+SZNrt/thm2xvJdoMTieL3hyEcwV8JbqyZTLsmzQ6HFj6UsIFY+BBJXUyyYjvJzBbz0BEZjAsfwGHCjDCzAxlWvNX/RQ8M4MKHQjvyhQ8AYcLzbyTy3emEasJAErd5C12PL+PA+v7/1qSFD3rCHfRSlfsGLGwHL5eGTQmWH2bYDh1Jks8vpfnGa2m65iqarrmWXbc8cFhhKz0UuCXMCfYsWjgaifRGs3TEvPoT8N50oeC82g4FzMrA82oj5PPoVJF49ccJ2RsLttlWKVPgljDfibPMUlF59ef4k4t3G3m1PXVs4Wf0vdqYVjfJLBWVV3/83zrVLBWMzbZKWf67VUpCeM4Ss1RUXv2ZNi9/8Njg1fblZ3k8fg4grzauGneBWSoqr/6UXb7ALBWMzbZKmf+OO+++1yxKafCPmoqb7CTbsN48ZF34opspu+gWswxA9EQfqbjLro/szr/OXOBn1oL8oTfxBB/dSZf3P8+/I8TRWjgnwKJz8/+qPjkyhq5sgs1tH5uHrLtu4iUsmXiJWQYgMHESbnc3mffeMw8NqPJFi6lY5L2R5VCitxSOAdom/SBtk35o2ia9dClwRUQs0RiuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSZ+u2PVr4ICJigVaaiYhYoiEFERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglWvhwDNCeZgdpT7ND055mpUuBW+LiK+8k+dLDZtm68EU3U37F78xyn3V/TvP2qqxZLqiZC/zM+WH+nXMBlj6XYsW6o0xZDwvnBLj1spBZ7nP/h39j+SerzbJ11028hDumeu+Y27X0IeKPPWqWB1T5osVU3vpTszwkaUihhKXWryyJsAVIvvQwqfUrzTL0PtnaDluAt1dl+eiV/O2u2ZQtWNgCrFiXYc2m/G2vbny9JMIWYPknq1nd+LpZht4n20KHLUD8sUdJrHnRLA9JCtwSlly3zCwVlVd/3n0hf/DY4NX20/8pXNh+wauNJz5fa5aKyqs/iadXmaWCsdlWKVPglrDcZxvMUlF59WfP1pxZssar7Q+35w/igeTVxrvt28xSUXn1J/vB+2apYGy2VcoUuCXM5gRZf3j1p1ATZP3h1fbRTpD1h1cbNifI+sOrPwM1QdYfNtsqZQpcERFLFLhDQHDmmYSiUbMs0n91Eyifv5Dam25l2A0LqTpvOsEK8yQ5FL0WVsL2L6k0S4fNqRnGiHnfpvW1d0g07TIPH7baZV1miQfnJsySVbevKTNLzPpJt1nyNGVOFb+dGyJKjjdf7uSutRnyD5583YY/fj11Tnru+2bpkJ6ZfDeJcJCMmyXr5MiRw4eP4wL1vWc4BP1+ysJh1ra8yX1blxtf4Zt9fNmTZomWmdPNUh5hyhb/huiPLyRAEjfbMzTghKpxYpvZ/+vbaPt3i3lRXvVvbzZLQ46ecAe5immn4nMcsyx9HMJlPqLDfETr/UQri/NvNTpYx+SyMUytHM/plRM4I3IStemxRII1jKquY3TNMEYPG87I4fVcOe588/ICCuMbNYFABNyORtLbd5Levo9MdxKnfhSh42rMC+QbKHAHs5ETqa4JA+B6TPBYV+7ntB9VcdNTddzzyjB+9UbPf/e8VMvNSys5c8bQvCXTqQDxtjRuJsf2tgw/+Otufv9yB1f/pYUn34kTCARw3ACpWI62ZId5eQF1kGloIJsJ4x81gbIzplN2+hRCx0cg1kjy02bzAvkGQ/PuHgqCIUacPB5/3MFNOJAtzpPbV9QEOPtnVXxvcYhoKEfz7oOvdAWqfERnhZn7i0rOnz00b8tQZZDu1iy//OdezhlTwYXjwlw/o5IXP+hmw7YM6YSDi/3vo9udxM2C29xIuqmB9J5G0h1AJomb7O/gi6DAHbzcEafhdPog5uDuzVA/ZRojZ8+jeuTp5qmW+Djp6nLOme0j8WGKHXEf1UCi71VWl+ZNGRK1Qc6+voIzTrYfLKVgdyqDz/EzribIsx90sr8zy6n1fl5r6ARAEy7HNgXuIOVzK2htyZKLOeTaINecI72jnFjTO+apljhUR32U+SG214Vyh6qxPZ/7tGbZtx8CNQ511V+qDyFV4QAd8QypNIyOBPABLZ1ZqsL6UR0M9F0cpNwdr5FoWEvmQJZcDDKxMK1Nr5qnWZRl44o4G7fCCeeFGV9rHneomx1mfG2OLU8keH2DjWc5h+nfqeKeC4JEfb2f51Txp/khIuapltRXuMwY7vDmzi6iVQFW/reLzw9kuHRqNcHgof9CmZQ2Be4gl4tBrgMSB7rJpvr3+k7BfJpizf1dvPFqlvb9RqCmXGKNaTY+0sUzj6ex86KZy+ZNSV5tOtiXZEuaf2xOYXNaCsDJgeOG8QdquP3iSZwSybG7vZtzT/CzdP4oIo6fWGsKx3UI4v1XyqS0KXAHOTfmkKOGzs515qGiyHyaYs1dB3jo0nbuWxzj2UfiPH9vBw+c285Di2M8+5StsO3VnmLZC3H+tc8l2Z5mxeo4q5vMkwovl4qSaveRbHVJtrpcOnksPz9rPDecNpqyroP1tk+SZNrt/thm2xvJdoMTieL3hyEcwV8JbqyZTLsmzQ6HFj6UsIFY+BBJXUyyYjvJzBbz0BEZjAsfwGHCjDCzAxlWvNX/RQ8M4MKHQjvyhQ8AYcLzbyTy3emEasJAErd5C12PL+PA+v7/1qSFD3rCHfRSlfsGLGwHL5eGTQmWH2bYDh1Jks8vpfnGa2m65iqarrmWXbc8cFhhKz0UuCXMCfYsWjgaifRGs3TEvPoT8N50oeC82g4FzMrA82oj5PPoVJF49ccJ2RsLttlWKVPgljDfibPMUlF59ef4k4t3G3m1PXVs4Wf0vdqYVjfJLBWVV3/83zrVLBWMzbZKWf67VUpCeM4Ss1RUXv2ZNi9/8Njg1fblZ3k8fg4grzauGneBWSoqr/6UXb7ALBWMzbZKmf+OO+++1yxKafCPmoqb7CTbsN48ZF34opspu+gWswxA9EQfqbjLro/szr/OXOBn1oL8oTfxBB/dSZf3P8+/I8TRWjgnwKJz8/+qPjkyhq5sgs1tH5uHrLtu4iUsmXiJWQYgMHESbnc3mffeMw8NqPJFi6lY5L2R5VCitxSOAdom/SBtk35o2ia9dClwRUQs0RiuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSZ+u2PVr4ICJigVaaiYhYoiEFERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglWvhwDNCeZgdpT7ND055mpUuBW+LiK+8k+dLDZtm68EU3U37F78xyn3V/TvP2qqxZLqiZC/zM+WH+nXMBlj6XYsW6o0xZDwvnBLj1spBZ7nP/h39j+SerzbJ11028hDumeu+Y27X0IeKPPWqWB1T5osVU3vpTszwkaUihhKXWryyJsAVIvvQwqfUrzTL0PtnaDluAt1dl+eiV/O2u2ZQtWNgCrFiXYc2m/G2vbny9JMIWYPknq1nd+LpZht4n20KHLUD8sUdJrHnRLA9JCtwSlly3zCwVlVd/3n0hf/DY4NX20/8pXNh+wauNJz5fa5aKyqs/iadXmaWCsdlWKVPglrDcZxvMUlF59WfP1pxZssar7Q+35w/igeTVxrvt28xSUXn1J/vB+2apYGy2VcoUuCXM5gRZf3j1p1ATZP3h1fbRTpD1h1cbNifI+sOrPwM1QdYfNtsqZQpcERFLFLhDQHDmmYSiUbMs0n91Eyifv5Dam25l2A0LqTpvOsEK8yQ5FL0WVsL2L6k0S4fNqRnGiHnfpvW1d0g07TIPH7baZV1miQfnJsySVbevKTNLzPpJt1nyNGVOFb+dGyJKjjdf7uSutRnyD5583YY/fj11Tnru+2bpkJ6ZfDeJcJCMmyXr5MiRw4eP4wL1vWc4BP1+ysJh1ra8yX1blxtf4Zt9fNmTZomWmdPNUh5hyhb/huiPLyRAEjfbMzTghKpxYpvZ/+vbaPt3i3lRXvVvbzZLQ46ecAe5immn4nMcsyx9HMJlPqLDfETr/UQri/NvNTpYx+SyMUytHM/plRM4I3IStemxRII1jKquY3TNMEYPG87I4fVcOe588/ICCuMbNYFABNyORtLbd5Levo9MdxKnfhSh42rMC+QbKHAHs5ETqa4JA+B6TPBYV+7ntB9VcdNTddzzyjB+9UbPf/e8VMvNSys5c8bQvCXTqQDxtjRuJsf2tgw/+Otufv9yB1f/pYUn34kTCARw3ACpWI62ZId5eQF1kGloIJsJ4x81gbIzplN2+hRCx0cg1kjy02bzAvkGQ/PuHgqCIUacPB5/3MFNOJAtzpPbV9QEOPtnVXxvcYhoKEfz7oOvdAWqfERnhZn7i0rOnz00b8tQZZDu1iy//OdezhlTwYXjwlw/o5IXP+hmw7YM6YSDi/3vo9udxM2C29xIuqmB9J5G0h1AJomb7O/gi6DAHbzcEafhdPog5uDuzVA/ZRojZ8+jeuTp5qmW+Djp6nLOme0j8WGKHXEf1UCi71VWl+ZNGRK1Qc6+voIzTrYfLKVgdyqDz/EzribIsx90sr8zy6n1fl5r6ARAEy7HNgXuIOVzK2htyZKLOeTaINecI72jnFjTO+apljhUR32U+SG214Vyh6qxPZ/7tGbZtx8CNQ511V+qDyFV4QAd8QypNIyOBPABLZ1ZqsL6UR0M9F0cpNwdr5FoWEvmQJZcDDKxMK1Nr5qnWZRl44o4G7fCCeeFGV9rHneomx1mfG2OLU8keH2DjWc5h+nfqeKeC4JEfb2f51Txp/khIuapltRXuMwY7vDmzi6iVQFW/reLzw9kuHRqNcHgof9CmZQ2Be4gl4tBrgMSB7rJpvr3+k7BfJpizf1dvPFqlvb9RqCmXGKNaTY+0sUzj6ex86KZy+ZNSV5tOtiXZEuaf2xOYXNaCsDJgeOG8QdquP3iSZwSybG7vZtzT/CzdP4oIo6fWGsKx3UI4v1XyqS0KXAHOTfmkKOGzs515qGiyHyaYs1dB3jo0nbuWxzj2UfiPH9vBw+c285Di2M8+5StsO3VnmLZC3H+tc8l2Z5mxeo4q5vMkwovl4qSaveRbHVJtrpcOnksPz9rPDecNpqyroP1tk+SZNrt/thm2xvJdoMTieL3hyEcwV8JbqyZTLsmzQ6HFj6UsIFY+BBJXUyyYjvJzBbz0BEZjAsfwGHCjDCzAxlWvNX/RQ8M4MKHQjvyhQ8AYcLzbyTy3emEasJAErd5C12PL+PA+v7/1qSFD3rCHfRSlfsGLGwHL5eGTQmWH2bYDh1Jks8vpfnGa2m65iqarrmWXbc8cFhhKz0UuCXMCfYsWjgaifRGs3TEvPoT8N50oeC82g4FzMrA82oj5PPoVJF49ccJ2RsLttlWKVPgljDfibPMUlF59ef4k4t3G3m1PXVs4Wf0vdqYVjfJLBWVV3/83zrVLBWMzbZKWf67VUpCeM4Ss1RUXv2ZNi9/8Njg1fblZ3k8fg4grzauGneBWSoqr/6UXb7ALBWMzbZKmf+OO+++1yxKafCPmoqb7CTbsN48ZF34opspu+gWswxA9EQfqbjLro/szr/OXOBn1oL8oTfxBB/dSZf3P8+/I8TRWjgnwKJz8/+qPjkyhq5sgs1tH5uHrLtu4iUsmXiJWQYgMHESbnc3mffeMw8NqPJFi6lY5L2R5VCitxSOAdom/SBtk35o2ia9dClwRUQs0RiuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSZ+u2PVr4ICJigVaaiYhYoiEFERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglWvhwDNCeZgdpT7ND055mpUuBW+LiK+8k+dLDZtm68EU3U37F78xyn3V/TvP2qqxZLqiZC/zM+WH+nXMBlj6XYsW6o0xZDwvnBLj1spBZ7nP/h39j+SerzbJ11028hDumeu+Y27X0IeKPPWqWB1T5osVU3vpTszwkaUihhKXWryyJsAVIvvQwqfUrzTL0PtnaDluAt1dl+eiV/O2u2ZQtWNgCrFiXYc2m/G2vbny9JMIWYPknq1nd+LpZht4n20KHLUD8sUdJrHnRLA9JCtwSlly3zCwVlVd/3n0hf/DY4NX20/8pXNh+wauNJz5fa5aKyqs/iadXmaWCsdlWKVPglrDcZxvMUlF59WfP1pxZssar7Q+35w/igeTVxrvt28xSUXn1J/vB+2apYGy2VcoUuCXM5gRZf3j1p1ATZP3h1fbRTpD1h1cbNifI+sOrPwM1QdYfNtsqZQpcERFLFLhDQHDmmYSiUbMs0n91Eyifv5Dam25l2A0LqTpvOsEK8yQ5FL0WVsL2L6k0S4fNqRnGiHnfpvW1d0g07TIPH7baZV1miQfnJsySVbevKTNLzPpJt1nyNGVOFb+dGyJKjjdf7uSutRnyD5583YY/fj11Tnru+2bpkJ6ZfDeJcJCMmyXr5MiRw4eP4wL1vWc4BP1+ysJh1ra8yX1blxtf4Zt9fNmTZomWmdPNUh5hyhb/huiPLyRAEjfbMzTghKpxYpvZ/+vbaPt3i3lRXvVvbzZLQ46ecAe5immn4nMcsyx9HMJlPqLDfETr/UQri/NvNTpYx+SyMUytHM/plRM4I3IStemxRII1jKquY3TNMEYPG87I4fVcOe588/ICCuMbNYFABNyORtLbd5Levo9MdxKnfhSh42rMC+QbKHAHs5ETqa4JA+B6TPBYV+7ntB9VcdNTddzzyjB+9UbPf/e8VMvNSys5c8bQvCXTqQDxtjRuJsf2tgw/+Otufv9yB1f/pYUn34kTCARw3ACpWI62ZId5eQF1kGloIJsJ4x81gbIzplN2+hRCx0cg1kjy02bzAvkGQ/PuHgqCIUacPB5/3MFNOJAtzpPbV9QEOPtnVXxvcYhoKEfz7oOvdAWqfERnhZn7i0rOnz00b8tQZZDu1iy//OdezhlTwYXjwlw/o5IXP+hmw7YM6YSDi/3vo9udxM2C29xIuqmB9J5G0h1AJomb7O/gi6DAHbzcEafhdPog5uDuzVA/ZRojZ8+jeuTp5qmW+Djp6nLOme0j8WGKHXEf1UCi71VWl+ZNGRK1Qc6+voIzTrYfLKVgdyqDz/EzribIsx90sr8zy6n1fl5r6ARAEy7HNgXuIOVzK2htyZKLOeTaINecI72jnFjTO+apljhUR32U+SG214Vyh6qxPZ/7tGbZtx8CNQ511V+qDyFV4QAd8QypNIyOBPABLZ1ZqsL6UR0M9F0cpNwdr5FoWEvmQJZcDDKxMK1Nr5qnWZRl44o4G7fCCeeFGV9rHneomx1mfG2OLU8keH2DjWc5h+nfqeKeC4JEfb2f51Txp/khIuapltRXuMwY7vDmzi6iVQFW/reLzw9kuHRqNcHgof9CmZQ2Be4gl4tBrgMSB7rJpvr3+k7BfJpizf1dvPFqlvb9RqCmXGKNaTY+0sUzj6ex86KZy+ZNSV5tOtiXZEuaf2xOYXNaCsDJgeOG8QdquP3iSZwSybG7vZtzT/CzdP4oIo6fWGsKx3UI4v1XyqS0KXAHOTfmkKOGzs515qGiyHyaYs1dB3jo0nbuWxzj2UfiPH9vBw+c285Di2M8+5StsO3VnmLZC3H+tc8l2Z5mxeo4q5vMkwovl4qSaveRbHVJtrpcOnksPz9rPDecNpqyroP1tk+SZNrt/thm2xvJdoMTieL3hyEcwV8JbqyZTLsmzQ6HFj6UsIFY+BBJXUyyYjvJzBbz0BEZjAsfwGHCjDCzAxlWvNX/RQ8M4MKHQjvyhQ8AYcLzbyTy3emEasJAErd5C12PL+PA+v7/1qSFD3rCHfRSlfsGLGwHL5eGTQmWH2bYDh1Jks8vpfnGa2m65iqarrmWXbc8cFhhKz0UuCXMCfYsWjgaifRGs3TEvPoT8N50oeC82g4FzMrA82oj5PPoVJF49ccJ2RsLttlWKVPgljDfibPMUlF59ef4k4t3G3m1PXVs4Wf0vdqYVjfJLBWVV3/83zrVLBWMzbZKWf67VUpCeM4Ss1RUXv2ZNi9/8Njg1fblZ3k8fg4grzauGneBWSoqr/6UXb7ALBWMzbZKmf+OO+++1yxKafCPmoqb7CTbsN48ZF34opspu+gWswxA9EQfqbjLro/szr/OXOBn1oL8oTfxBB/dSZf3P8+/I8TRWjgnwKJz8/+qPjkyhq5sgs1tH5uHrLtu4iUsmXiJWQYgMHESbnc3mffeMw8NqPJFi6lY5L2R5VCitxSOAdom/SBtk35o2ia9dClwRUQs0RiuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSZ+u2PVr4ICJigVaaiYhYoiEFERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldA" alt="talabat mart" style="height:52px;object-fit:contain;"/>
+  <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAVwAAAGBCAYAAAAqtgndAAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAACyWSURBVHhe7d17cFXV/ffx9z7XXE8SyBmVu1xEoYog/OyjzoDWC1LUqUy9AY8dsWO1M2qrM/XSjtqrTq3l59S/OjBtFceieClWsYwVHe0jIuAVqRgVSLjlBjlJzv3s54/EoMuzJUDOOofk85pxxvPde2etITuf2Vlrryxnf0eXi4iIFJzPLIiISGEocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldAxBIFroiIJQpcERFLFLgiIpYocEVELFHgiohYosAVEbFEgSsiYokCV0TEEgWuiIglClwREUsUuCIilihwRUQsUeCKiFiiwBURsUSBKyJiiQJXRMQSBa6IiCUKXBERSxS4IiKWKHBFRCxR4IqIWKLAFRGxRIErImKJAldA" alt="talabat mart" style="height:52px;object-fit:contain;"/>
 </div>
 <nav>
   <span class="sub" style="font-weight:600;">Rebate Debit Note Dashboard</span>
-  <span id="gstatus-nav" style="font-size:12px;color:#888;">⚙ Gmail not set</span>
+  <span id="gstatus-nav" style="font-size:12px;color:#888;">⚙ Gmail not connected</span>
   <button class="tl" onclick="openGmail()">⚙ Gmail Settings</button>
 </nav>
 <div class="cards">
@@ -585,71 +644,58 @@ td{padding:9px 12px;vertical-align:middle;}
 <div id="gmodal"><div id="gmodal-inner">
   <h3>⚙ Gmail Settings</h3>
   <div class="tabs">
-    <button class="tab-btn active" id="tab-oauth" onclick="setTab('oauth')">🔗 Auto Send<br><span style="font-weight:400;font-size:10px;">Sign in with Google</span></button>
-    <button class="tab-btn" id="tab-smtp" onclick="setTab('smtp')">🔑 Auto Send<br><span style="font-weight:400;font-size:10px;">App Password</span></button>
-    <button class="tab-btn" id="tab-browser" onclick="setTab('browser')">🌐 Manual<br><span style="font-weight:400;font-size:10px;">Chrome Gmail</span></button>
+    <button class="tab-btn active" id="tab-oauth" onclick="setTab('oauth')">🔗 Connect Google<br><span style="font-weight:400;font-size:10px;">Popup sign-in</span></button>
+    <button class="tab-btn" id="tab-smtp" onclick="setTab('smtp')">🔑 App Password<br><span style="font-weight:400;font-size:10px;">SMTP auto-send</span></button>
+    <button class="tab-btn" id="tab-browser" onclick="setTab('browser')">🌐 Browser<br><span style="font-weight:400;font-size:10px;">Manual attach</span></button>
   </div>
 
   <!-- OAuth panel -->
   <div id="panel-oauth" class="panel show">
-    <div class="field">
-      <label>Google OAuth Client ID</label>
-      <input type="text" id="g-client-id" placeholder="xxxxxxxx.apps.googleusercontent.com"/>
-      <div class="hint">
-        Get your Client ID from <a href="https://console.cloud.google.com" target="_blank">Google Cloud Console</a>:<br>
-        1. Create project → APIs &amp; Services → Enable <strong>Gmail API</strong><br>
-        2. Credentials → Create → OAuth Client ID → Web Application<br>
-        3. Add your Render URL under <em>Authorized JavaScript origins</em><br>
-        4. Copy the Client ID and paste it above.<br><br>
-        ✅ <strong>One-time setup.</strong> After that, all colleagues just click Sign In — no App Password ever.
+    <div id="oauth-connected-box" class="connected-box" style="display:none;">
+      ✅ Connected as <strong id="oauth-email-disp"></strong><br>
+      <span style="font-size:12px;color:#555;">Emails will send automatically with PDF attached.</span>
+    </div>
+    <div id="oauth-action-box">
+      <p style="font-size:13px;color:#444;margin-bottom:12px;line-height:1.6;">
+        Click below to sign in with your Google account in a popup window.<br>
+        Once you approve access, all emails will send automatically with the PDF attached — no manual steps.
+      </p>
+      <button class="google-btn" onclick="connectGooglePopup()">
+        <svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
+        Sign in with Google
+      </button>
+      <div id="oauth-not-configured" style="display:none;background:rgba(239,68,68,.08);border:1px solid var(--red);border-radius:8px;padding:12px;font-size:12px;color:#7f1d1d;line-height:1.7;">
+        ⚠️ <strong>Google OAuth not configured on the server.</strong><br>
+        Ask IT to add <code>GOOGLE_CLIENT_ID</code> and <code>GOOGLE_CLIENT_SECRET</code> as Render environment variables,<br>
+        with this Redirect URI registered in Google Cloud Console:<br>
+        <code id="redirect-uri-display" style="word-break:break-all;"></code>
       </div>
     </div>
-    <div id="oauth-connected" id="oauth-connected-box">
-      ✅ <strong id="oauth-email-disp"></strong> connected — emails send automatically with PDF attached!
-    </div>
-    <div id="oauth-btn-wrap">
-      <button class="tl" onclick="connectGoogle()" style="width:100%;padding:11px;">🔗 Sign in with Google</button>
-    </div>
-    <div style="display:flex;gap:10px;margin-top:14px;">
-      <button class="tl" onclick="saveGmail()" style="flex:1;">💾 Save Settings</button>
-      <button class="out" onclick="closeGmail()" style="flex:1;">Cancel</button>
+    <div style="display:flex;gap:10px;margin-top:18px;">
+      <button class="out" onclick="closeGmail()" style="flex:1;">Close</button>
     </div>
   </div>
 
   <!-- SMTP panel -->
   <div id="panel-smtp" class="panel">
-    <div class="field">
-      <label>Gmail Address</label>
-      <input type="email" id="g-user-smtp" placeholder="yourname@gmail.com"/>
-    </div>
+    <div class="field"><label>Gmail Address</label><input type="email" id="g-user-smtp" placeholder="yourname@gmail.com"/></div>
     <div class="field">
       <label>Gmail App Password</label>
       <input type="password" id="g-pass" placeholder="xxxx xxxx xxxx xxxx"/>
-      <div class="hint">
-        Use an <strong>App Password</strong>, not your regular password.<br>
-        Get it at: <a href="https://myaccount.google.com/apppasswords" target="_blank">myaccount.google.com/apppasswords</a><br>
-        (Requires 2-Step Verification on your Google account)
-      </div>
+      <div class="hint">Get it at: <a href="https://myaccount.google.com/apppasswords" target="_blank">myaccount.google.com/apppasswords</a><br>(Requires 2-Step Verification on your Google account)</div>
     </div>
     <div style="display:flex;gap:10px;margin-top:14px;">
-      <button class="tl" onclick="saveGmail()" style="flex:1;">💾 Save &amp; Connect</button>
+      <button class="tl" onclick="saveSmtp()" style="flex:1;">💾 Save &amp; Connect</button>
       <button class="out" onclick="closeGmail()" style="flex:1;">Cancel</button>
     </div>
   </div>
 
   <!-- Browser panel -->
   <div id="panel-browser" class="panel">
-    <div class="field">
-      <label>Your Gmail Address</label>
-      <input type="email" id="g-user-browser" placeholder="yourname@gmail.com"/>
-    </div>
-    <div class="hint" style="margin-top:4px;">
-      ℹ️ Manual mode — clicking Send opens Gmail in a new tab and downloads the PDF.<br>
-      You attach the PDF yourself and click Send in Gmail.<br><br>
-      For fully automatic sending, use <strong>Sign in with Google</strong> or <strong>App Password</strong> instead.
-    </div>
+    <div class="field"><label>Your Gmail Address</label><input type="email" id="g-user-browser" placeholder="yourname@gmail.com"/></div>
+    <div class="hint" style="margin-top:8px;">ℹ️ Manual mode — Gmail opens pre-filled in a new tab. Attach the PDF and click Send yourself.<br><br>For fully automatic sending, use <strong>Connect Google</strong> or <strong>App Password</strong>.</div>
     <div style="display:flex;gap:10px;margin-top:18px;">
-      <button class="tl" onclick="saveGmail()" style="flex:1;">💾 Save</button>
+      <button class="tl" onclick="saveBrowser()" style="flex:1;">💾 Save</button>
       <button class="out" onclick="closeGmail()" style="flex:1;">Cancel</button>
     </div>
   </div>
@@ -657,20 +703,30 @@ td{padding:9px 12px;vertical-align:middle;}
 
 <div id="toast-wrap"></div>
 <script>
-let rows=[], SID='';
-let _gmailMode='oauth';
-let _oauthToken=null, _tokenExpiry=0, _oauthEmail='';
-let _clientId='';
+let rows=[], SID='', _gmailMode='oauth', _oauthConnected=false;
 
 (async()=>{
-  const r=await fetch('/api/session-id').then(r=>r.json());
-  SID=r.sid;
+  const r = await fetch('/api/session-id').then(r=>r.json());
+  SID = r.sid;
   loadRows();
   checkGmail();
+  // Listen for OAuth popup message
+  window.addEventListener('message', e => {
+    if(e.data && e.data.ok !== undefined){
+      if(e.data.ok){
+        _oauthConnected = true;
+        showOAuthConnected(e.data.email);
+        checkGmail();
+        toast('✅ Connected as '+e.data.email+' — ready to send!');
+      } else {
+        toast('Google sign-in failed: '+(e.data.error||'unknown'), true);
+      }
+    }
+  });
 })();
 
 async function loadRows(){
-  const r=await fetch('/api/rows').then(r=>r.json());
+  const r = await fetch('/api/rows').then(r=>r.json());
   if(!r.ok){toast('Error: '+r.error,true);return;}
   rows=r.rows; render(); cards();
 }
@@ -707,7 +763,6 @@ function sel(){
 }
 function toggleAll(cb){document.querySelectorAll('.rc').forEach(c=>c.checked=cb.checked);}
 
-/* Single generate */
 async function genOne(i){
   const btn=document.getElementById(`gb-${i}`);
   btn.innerHTML='<span class="spin"></span>';btn.disabled=true;
@@ -720,10 +775,8 @@ async function genOne(i){
   btn.innerHTML='⚡ Generate';btn.disabled=false;render();cards();
 }
 
-/* Batch generate */
 async function generateAll(){
-  const s=sel();
-  if(!s.length){toast('No rows',true);return;}
+  const s=sel();if(!s.length){toast('No rows',true);return;}
   prog(0,s.length,'Starting…');
   try{
     const res=await post('/api/generate-start',{rows:s});
@@ -735,17 +788,16 @@ async function generateAll(){
       if(!st.running){
         clearInterval(poll);
         st.results.forEach(r=>{if(r.ok){const m=rows.find(x=>x.pdf_name===r.pdf_name);if(m)m.pdf_exists=true;}});
-        const ok=st.results.filter(r=>r.ok).length, err=st.results.filter(r=>!r.ok).length;
+        const ok=st.results.filter(r=>r.ok).length,err=st.results.filter(r=>!r.ok).length;
         hideProg();
         toast(err===0?`✓ ${ok} PDFs generated`:`${ok} ok, ${err} failed`,err>0);
-        if(err>0) st.errors.slice(0,3).forEach(r=>toast(r.pdf_name+': '+r.error,true));
+        if(err>0)st.errors.slice(0,3).forEach(r=>toast(r.pdf_name+': '+r.error,true));
         render();cards();
       }
     },2500);
   }catch(e){hideProg();toast('Error: '+e.message,true);}
 }
 
-/* Preview */
 function previewOne(pn,sup){
   document.getElementById('modal-title').textContent=sup+' — '+pn;
   document.getElementById('modal-frame').src=`/preview/${SID}/${encodeURIComponent(pn)}`;
@@ -754,68 +806,15 @@ function previewOne(pn,sup){
 function closeModal(){document.getElementById('modal').classList.remove('show');document.getElementById('modal-frame').src='';}
 document.getElementById('modal').addEventListener('click',function(e){if(e.target===this)closeModal();});
 
-/* Download */
 function dlOne(pn){window.open(`/download/${SID}/${encodeURIComponent(pn)}`,'_blank');}
 function dlAll(){window.open(`/download-all/${SID}`,'_blank');}
 
-/* Delete */
 async function delOne(i,pn){
   if(!confirm('Delete '+pn+'?'))return;
   await fetch(`/api/delete/${encodeURIComponent(pn)}`,{method:'DELETE'});
-  rows[i].pdf_exists=false;rows[i].email_sent=false;
-  render();cards();toast('🗑 Deleted');
+  rows[i].pdf_exists=false;rows[i].email_sent=false;render();cards();toast('🗑 Deleted');
 }
 
-/* ── Gmail OAuth ── */
-function connectGoogle(){
-  if(!_clientId){toast('Enter your Google Client ID first',true);return;}
-  if(typeof google==='undefined'||!google.accounts){toast('Google library still loading — try again in a moment',true);return;}
-  const client=google.accounts.oauth2.initTokenClient({
-    client_id:_clientId,
-    scope:'https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/userinfo.email',
-    callback:(resp)=>{
-      if(resp.error){toast('Google sign-in failed: '+resp.error,true);return;}
-      _oauthToken=resp.access_token;
-      _tokenExpiry=Date.now()+(resp.expires_in||3599)*1000;
-      // Fetch user email
-      fetch('https://www.googleapis.com/oauth2/v1/userinfo?alt=json',{headers:{Authorization:'Bearer '+_oauthToken}})
-        .then(r=>r.json()).then(info=>{
-          _oauthEmail=info.email||'Google user';
-          showOAuthConnected();
-          toast('✅ Connected as '+_oauthEmail+' — ready to auto-send!');
-        }).catch(()=>{_oauthEmail='Google user';showOAuthConnected();});
-    }
-  });
-  client.requestAccessToken();
-}
-
-function showOAuthConnected(){
-  document.getElementById('oauth-email-disp').textContent=_oauthEmail;
-  document.getElementById('oauth-connected').style.display='block';
-  document.getElementById('oauth-btn-wrap').style.display='none';
-}
-
-async function ensureToken(){
-  if(_oauthToken && Date.now()<_tokenExpiry-30000) return _oauthToken;
-  if(!_clientId){return null;}
-  return new Promise((resolve,reject)=>{
-    if(typeof google==='undefined'){reject('Google library not loaded');return;}
-    const client=google.accounts.oauth2.initTokenClient({
-      client_id:_clientId,
-      scope:'https://www.googleapis.com/auth/gmail.send',
-      prompt:'',
-      callback:(resp)=>{
-        if(resp.error){reject(resp.error);return;}
-        _oauthToken=resp.access_token;
-        _tokenExpiry=Date.now()+(resp.expires_in||3599)*1000;
-        resolve(_oauthToken);
-      }
-    });
-    client.requestAccessToken();
-  });
-}
-
-/* ── Send email ── */
 function gmailComposeUrl(to,cc,subject,body){
   const p=new URLSearchParams({view:'cm',to,cc,su:subject,body});
   return 'https://mail.google.com/mail/?'+p.toString();
@@ -827,23 +826,17 @@ async function sendOne(i){
   const btn=document.getElementById(`mb-${i}`);
   btn.innerHTML='<span class="spin"></span>';btn.disabled=true;
   const subject=`Rebate Debit Note ${row.dn_number||''} - DH Store Bahrain (tMart)`.trim();
-  const body=`Dear ${row.supplier},\\n\\nPlease find attached your Rebate Debit Note.\\n\\nRegards,\\ntMart Finance Team`;
+  const bodyTxt=`Dear ${row.supplier},\\n\\nPlease find attached your Rebate Debit Note.\\n\\nRegards,\\ntMart Finance Team`;
   try{
-    if(_gmailMode==='oauth'){
-      const token=await ensureToken();
-      if(!token){toast('Sign in with Google first — open Gmail Settings',true);btn.innerHTML='📧 Send';btn.disabled=false;return;}
-      const res=await post('/api/send-oauth-email',{access_token:token,pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
-      if(res.ok){rows[i].email_sent=true;toast('✅ Email auto-sent to '+row.email);}
-      else toast('Email error: '+res.error,true);
-    } else if(_gmailMode==='smtp'){
-      const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
-      if(res.ok){rows[i].email_sent=true;toast('✅ Email sent to '+row.email);}
-      else toast('Email error: '+res.error,true);
-    } else {
+    if(_gmailMode==='browser'){
       window.open(`/download/${SID}/${encodeURIComponent(row.pdf_name)}`,'_blank');
-      setTimeout(()=>window.open(gmailComposeUrl(row.email,row.cc,subject,body),'_blank'),800);
+      setTimeout(()=>window.open(gmailComposeUrl(row.email,row.cc,subject,bodyTxt),'_blank'),800);
       rows[i].email_sent=true;
       toast('📥 PDF downloaded — attach it in the Gmail tab that opened');
+    } else {
+      const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
+      if(res.ok){rows[i].email_sent=true;toast('✅ Email sent to '+row.email);}
+      else toast('Email failed: '+res.error,true);
     }
   }catch(e){toast('Error: '+e.message,true);}
   btn.innerHTML='📧 Send';btn.disabled=false;render();cards();
@@ -852,41 +845,45 @@ async function sendOne(i){
 async function sendAll(){
   const s=sel().filter(r=>r.pdf_exists);
   if(!s.length){toast('No PDFs ready — generate first',true);return;}
-  let token=null;
-  if(_gmailMode==='oauth'){
-    try{token=await ensureToken();}catch(e){}
-    if(!token){toast('Sign in with Google first — open Gmail Settings',true);return;}
-  }
   prog(0,s.length,'Sending emails…');
   let sent=0,failed=0;
   for(const row of s){
     try{
-      if(_gmailMode==='oauth'){
-        const res=await post('/api/send-oauth-email',{access_token:token,pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
-        if(res.ok){row.email_sent=true;sent++;}
-        else{failed++;toast('Failed '+row.supplier+': '+res.error,true);}
-      } else if(_gmailMode==='smtp'){
-        const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
-        if(res.ok){row.email_sent=true;sent++;}
-        else{failed++;toast('Failed '+row.supplier+': '+res.error,true);}
-      } else {
+      if(_gmailMode==='browser'){
         const subject=`Rebate Debit Note ${row.dn_number||''} - DH Store Bahrain (tMart)`.trim();
-        const body=`Dear ${row.supplier},\\n\\nPlease find attached your Rebate Debit Note.\\n\\nRegards,\\ntMart Finance Team`;
-        window.open(gmailComposeUrl(row.email,row.cc,subject,body),'_blank');
+        const bodyTxt=`Dear ${row.supplier},\\n\\nPlease find attached your Rebate Debit Note.\\n\\nRegards,\\ntMart Finance Team`;
+        window.open(gmailComposeUrl(row.email,row.cc,subject,bodyTxt),'_blank');
         row.email_sent=true;sent++;
         await new Promise(r=>setTimeout(r,600));
+      } else {
+        const res=await post('/api/send-email',{pdf_name:row.pdf_name,email:row.email,cc:row.cc,supplier:row.supplier,dn_number:row.dn_number});
+        if(res.ok){row.email_sent=true;sent++;}
+        else{failed++;toast('Failed ('+row.supplier+'): '+res.error,true);}
       }
-    }catch(e){failed++;}
+    }catch(e){failed++;toast('Error: '+e.message,true);}
     prog(sent+failed,s.length,`Sending… ${sent+failed}/${s.length}`);
-    await new Promise(r=>setTimeout(r,200));
+    await new Promise(r=>setTimeout(r,300));
   }
   hideProg();
-  if(_gmailMode==='browser') toast(`📥 Download ZIP then attach PDFs to the ${sent} Gmail tabs`);
+  if(_gmailMode==='browser') toast(`Download the ZIP and attach PDFs to the ${sent} Gmail tabs opened`);
   else toast(failed===0?`✅ ${sent} emails sent!`:`${sent} sent, ${failed} failed`,failed>0);
   render();cards();
 }
 
-/* ── Gmail settings modal ── */
+/* ── Gmail OAuth popup ── */
+function connectGooglePopup(){
+  const w=500,h=600,l=screen.width/2-w/2,t=screen.height/2-h/2;
+  window.open('/auth/google','gmailOAuth',`width=${w},height=${h},left=${l},top=${t},menubar=no,toolbar=no,location=no`);
+  toast('🔗 Google sign-in window opened — approve access there');
+}
+
+function showOAuthConnected(email){
+  document.getElementById('oauth-email-disp').textContent=email;
+  document.getElementById('oauth-connected-box').style.display='block';
+  document.getElementById('oauth-action-box').querySelector('.google-btn').textContent='🔄 Re-connect Google';
+}
+
+/* ── Gmail Settings modal ── */
 function openGmail(){document.getElementById('gmodal').classList.add('show');}
 function closeGmail(){document.getElementById('gmodal').classList.remove('show');}
 document.getElementById('gmodal').addEventListener('click',function(e){if(e.target===this)closeGmail();});
@@ -899,40 +896,35 @@ function setTab(t){
   _gmailMode=t;
 }
 
-async function saveGmail(){
-  const mode=_gmailMode;
-  let user='',pass='';
-  if(mode==='smtp'){
-    user=document.getElementById('g-user-smtp').value.trim();
-    pass=document.getElementById('g-pass').value.trim();
-    if(!user||!pass){toast('Enter Gmail address and App Password',true);return;}
-  } else if(mode==='browser'){
-    user=document.getElementById('g-user-browser').value.trim();
-    if(!user){toast('Enter your Gmail address',true);return;}
-  } else {
-    // oauth: save client_id
-    _clientId=document.getElementById('g-client-id').value.trim();
-    if(!_clientId){toast('Enter your Google Client ID',true);return;}
-    user=_oauthEmail||'oauth';
-  }
-  await post('/api/gmail-settings',{mode,user,password:pass});
-  closeGmail();
-  checkGmail();
-  toast('✅ Gmail settings saved');
+async function saveSmtp(){
+  const user=document.getElementById('g-user-smtp').value.trim();
+  const pass=document.getElementById('g-pass').value.trim();
+  if(!user||!pass){toast('Enter Gmail address and App Password',true);return;}
+  await post('/api/gmail-settings',{mode:'smtp',user,password:pass});
+  closeGmail();checkGmail();toast('✅ Gmail SMTP connected');
+}
+async function saveBrowser(){
+  const user=document.getElementById('g-user-browser').value.trim();
+  if(!user){toast('Enter your Gmail address',true);return;}
+  await post('/api/gmail-settings',{mode:'browser',user,password:''});
+  closeGmail();checkGmail();toast('✅ Browser Gmail mode saved');
 }
 
 async function checkGmail(){
   const r=await fetch('/api/gmail-status').then(r=>r.json());
   const nav=document.getElementById('gstatus-nav');
+  _gmailMode=r.mode||'oauth';
+  setTab(_gmailMode);
   if(r.configured){
-    const modeLabel=r.mode==='oauth'?'OAuth':r.mode==='smtp'?'SMTP':'Browser';
-    nav.textContent=`✅ ${r.user} (${modeLabel})`;
-    nav.style.color='#16A34A';
-    _gmailMode=r.mode||'oauth';
-    setTab(_gmailMode);
+    const lbl=r.mode==='oauth'?'OAuth':r.mode==='smtp'?'SMTP':'Browser';
+    nav.textContent=`✅ ${r.user} (${lbl})`;nav.style.color='#16A34A';
+    if(r.has_oauth && r.mode==='oauth') showOAuthConnected(r.user);
   } else {
-    nav.textContent='⚙ Gmail not set';
-    nav.style.color='#888';
+    nav.textContent='⚙ Gmail not connected';nav.style.color='#888';
+  }
+  if(!r.oauth_configured){
+    document.getElementById('oauth-not-configured').style.display='block';
+    document.getElementById('redirect-uri-display').textContent=location.origin+'/auth/google/callback';
   }
 }
 
@@ -941,16 +933,14 @@ async function uploadExcel(el){
   const f=el.files[0];if(!f)return;
   const fd=new FormData();fd.append('file',f);
   const r=await fetch('/api/upload-excel',{method:'POST',body:fd}).then(r=>r.json());
-  if(r.ok){toast('✅ Excel uploaded');loadRows();}
-  else toast('Error: '+r.error,true);
+  if(r.ok){toast('✅ Excel uploaded');loadRows();}else toast('Error: '+r.error,true);
   el.value='';
 }
 async function uploadTemplate(el){
   const f=el.files[0];if(!f)return;
   const fd=new FormData();fd.append('file',f);
   const r=await fetch('/api/upload-template',{method:'POST',body:fd}).then(r=>r.json());
-  toast(r.ok?'✅ Template uploaded':'Error: '+r.error,!r.ok);
-  el.value='';
+  toast(r.ok?'✅ Template uploaded':'Error: '+r.error,!r.ok);el.value='';
 }
 
 /* ── Utilities ── */
@@ -960,8 +950,7 @@ async function post(url,data){
 }
 function toast(msg,err=false){
   const w=document.getElementById('toast-wrap');
-  const d=document.createElement('div');
-  d.className='toast'+(err?' err':'');d.textContent=msg;
+  const d=document.createElement('div');d.className='toast'+(err?' err':'');d.textContent=msg;
   w.appendChild(d);setTimeout(()=>d.remove(),5000);
 }
 function prog(done,total,label){
